@@ -1,0 +1,730 @@
+service:
+  name: tpip-audit-trail
+
+provider:
+  name: aws
+  runtime: nodejs14.x
+  timeout: 30
+  stage: ${file(../env.yml):${opt:stage}.environment}
+  region: eu-west-2
+  envId: ${file(../env.yml):${opt:stage}.envId}
+  allowedOriginsS3: ${file(../env.yml):${opt:stage}.allowedOriginsS3}
+  allowedOriginsCF: ${file(../env.yml):${opt:stage}.allowedOriginsCF}
+  lambdaDLQueue: ${file(../env.yml):${opt:stage}.lambdaDLQueue}
+  tracing:
+    apiGateway: true
+    lambda: true
+  deploymentBucket:
+    name: 'serverless-deployments-bucket-${self:provider.region}'
+    serverSideEncryption: AES256
+    blockPublicAccess: true
+    skipPolicySetup: false
+  logs:
+    restApi: true
+    httpApi: true
+  vpc:
+    securityGroupIds:
+      - !Ref EsSecurityGroup
+    subnetIds:
+      - !Ref SubnetAPrivate
+      - !Ref SubnetBPrivate
+  environment:
+    STAGE: ${self:provider.stage, 'qa'}
+    ENV_ID: ${self:provider.envId}
+    AUDIT_TRAIL_TABLE: auditTrail
+    AUDIT_TRAIL_ES_BACKUP_TABLE: auditTrailEsBackup
+    AUDIT_TRAIL_DLQUEUE: audit-deadletter-queue
+    AUDIT_TRAIL_QUEUE: audit-queue
+    AUDIT_TRAIL_ES: audit-trail
+    ALLOWED_ORIGINS_S3: ${self:provider.allowedOriginsS3}
+    ALLOWED_ORIGINS_CF: ${self:provider.allowedOriginsCF}
+    REGION: ${self:provider.region}
+    QUEUE_ENDPOINT:  ${file(../env.yml):${opt:stage}.queue_endpoint}  #Ref: AuditQueue
+    ES_ENDPOINT_URL : ${file(../env.yml):${opt:stage}.es_endpointUrl}
+    ES_ENDPOINT:
+      Fn::GetAtt:
+        - AuditEs
+        - DomainEndpoint
+    LAMBDA_DL_QUEUE: ${self:provider.lambdaDLQueue}
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - sqs:DeleteMessage
+        - sqs:ReceiveMessage
+        - sqs:SendMessage
+      Resource: 'arn:aws:sqs:${self:provider.region}:*:${self:provider.environment.AUDIT_TRAIL_DLQUEUE}'
+    - Effect: Allow
+      Action:
+        - sqs:DeleteMessage
+        - sqs:ReceiveMessage
+        - sqs:SendMessage
+      Resource: 'arn:aws:sqs:${self:provider.region}:*:${self:provider.environment.AUDIT_TRAIL_QUEUE}'
+    - Effect: Allow
+      Action:
+        - dynamodb:Query
+        - dynamodb:GetItem
+        - dynamodb:PutItem
+        - dynamodb:UpdateItem
+        - dynamodb:DeleteItem
+        - dynamodb:BatchGetItem
+      Resource:
+        - 'arn:aws:dynamodb:${opt:region, self:provider.region}:${self:provider.envId}:table/${self:provider.environment.AUDIT_TRAIL_TABLE}'
+        - 'arn:aws:dynamodb:${opt:region, self:provider.region}:${self:provider.envId}:table/${self:provider.environment.AUDIT_TRAIL_ES_BACKUP_TABLE}'
+    - Effect: Allow
+      Action:
+        - 'es:*'
+      Resource:
+        - 'arn:aws:es:${opt:region, self:provider.region}:${self:provider.envId}:domain/${self:provider.environment.AUDIT_TRAIL_ES}'
+        - 'arn:aws:es:${opt:region, self:provider.region}:${self:provider.envId}:domain/${self:provider.environment.AUDIT_TRAIL_ES}/*'
+    - Effect: Allow
+      Action:
+        - lambda:InvokeFunction
+        - lambda:InvokeAsync
+        - logs:CreateLogGroup
+        - logs:CreateLogStream
+        - logs:DescribeLogGroups
+        - logs:PutLogEvents
+        - logs:DescribeLogStreams
+      Resource: '*'
+    - Effect: Allow
+      Action:
+        - sqs:SendMessage
+      Resource: 'arn:aws:sqs:${self:provider.region}:*:${self:provider.environment.LAMBDA_DL_QUEUE}'
+
+custom:
+#  authorizer:
+#    name: tpip_${self:provider.stage}
+#    arn: arn:aws:cognito-idp:eu-west-2:${self:provider.envId}:userpool/${self:provider.poolId}
+  serverless-offline:
+    host: 0.0.0.0
+  prune:
+    automatic: true
+    number: 3
+
+functions:
+  healthCheck:
+    handler: handler.healthCheckHandler
+#    events:
+#      - http:
+#          method: get
+#          path: /tpip/v1/trail/health-check
+#          cors: true
+#          authorizer:
+#            type: COGNITO_USER_POOLS
+#            authorizerId:
+#              Ref: ApiGatewayAuthorizer
+    deadLetter:
+      targetArn: arn:aws:sqs:${self:provider.region}:${self:provider.envId}:${self:provider.environment.LAMBDA_DL_QUEUE}
+
+  auditQl:
+    handler: handler.auditQlHandler
+#    events:
+#      - http:
+#          method: post
+#          path: /tpip/v1/trail/ql/{domain}
+#          cors: true
+#          authorizer:
+#            type: COGNITO_USER_POOLS
+#            authorizerId:
+#              Ref: ApiGatewayAuthorizer
+#          request:
+#            parameters:
+#              paths:
+#                domain: true
+    deadLetter:
+      targetArn: arn:aws:sqs:${self:provider.region}:${self:provider.envId}:${self:provider.environment.LAMBDA_DL_QUEUE}
+
+  rotateES:
+    handler: handler.rotateESHandler
+    timeout: 900
+    events:
+      - schedule: cron(0 22 1 * ? *)
+        enabled: true
+    deadLetter:
+      targetArn: arn:aws:sqs:${self:provider.region}:${self:provider.envId}:${self:provider.environment.LAMBDA_DL_QUEUE}
+
+  createTrail:
+    handler: handler.createTrailHandler
+    timeout: 20
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - AuditQueue
+              - Arn
+    deadLetter:
+      targetArn: arn:aws:sqs:${self:provider.region}:${self:provider.envId}:${self:provider.environment.LAMBDA_DL_QUEUE}
+
+  dlQ:
+    handler: handler.dlQHandler
+    timeout: 900
+    events:
+      - schedule: cron(0 18 ? * MON-FRI *)
+        enabled: true
+    deadLetter:
+      targetArn: arn:aws:sqs:${self:provider.region}:${self:provider.envId}:${self:provider.environment.LAMBDA_DL_QUEUE}
+
+  getActivity:
+    handler: handler.getActivityHandler
+    events:
+      - http:
+          method: get
+          path: /tpip/v1/trail/activity-log
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId:
+              Ref: ApiGatewayAuthorizer
+    deadLetter:
+      targetArn: arn:aws:sqs:${self:provider.region}:${self:provider.envId}:${self:provider.environment.LAMBDA_DL_QUEUE}
+
+  activityFilter:
+    handler: handler.activityFilterHandler
+    events:
+      - http:
+          method: get
+          path: /tpip/v1/trail/activity-filter
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId:
+              Ref: ApiGatewayAuthorizer
+
+resources:
+  Resources:
+    AuditDLQueue:
+      Type: 'AWS::SQS::Queue'
+      Properties:
+        QueueName: ${self:provider.environment.AUDIT_TRAIL_DLQUEUE}
+        VisibilityTimeout: 60
+        MessageRetentionPeriod: 172800
+        KmsDataKeyReusePeriodSeconds: 300
+        KmsMasterKeyId: alias/aws/sqs
+    AuditQueue:
+      Type: 'AWS::SQS::Queue'
+      Properties:
+        QueueName: ${self:provider.environment.AUDIT_TRAIL_QUEUE}
+        VisibilityTimeout: 30
+        MessageRetentionPeriod: 18000
+        DelaySeconds: 3
+        ReceiveMessageWaitTimeSeconds: 20
+        KmsDataKeyReusePeriodSeconds: 300
+        KmsMasterKeyId: alias/aws/sqs
+        RedrivePolicy:
+          deadLetterTargetArn:
+            'Fn::GetAtt':
+              - AuditDLQueue
+              - Arn
+          maxReceiveCount: 2
+    AuditDb:
+      Type: 'AWS::DynamoDB::Table'
+      DeletionPolicy: Retain
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        TableName: ${self:provider.environment.AUDIT_TRAIL_TABLE}
+        StreamSpecification:
+          StreamViewType: 'NEW_AND_OLD_IMAGES'
+    AuditEsBackupDb:
+      Type: 'AWS::DynamoDB::Table'
+      DeletionPolicy: Retain
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: timeStamp
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+          - AttributeName: timeStamp
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        TableName: ${self:provider.environment.AUDIT_TRAIL_ES_BACKUP_TABLE}
+
+    EsKmsKey:
+      Type: "AWS::KMS::Key"
+      Properties:
+        Description: "This key is use for ES Encryption at rest"
+        Enabled: true
+        KeyPolicy:
+          Version: '2012-10-17'
+          Id: key-default-1
+          Statement:
+            - Sid: Enable KMS Permissions
+              Effect: Allow
+              Principal:
+                AWS: '*'
+              Action: kms:*
+              Resource: '*'
+
+    VPC:
+      Type: 'AWS::EC2::VPC'
+      Properties:
+        CidrBlock: !Sub '30.0.0.0/16'
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+        InstanceTenancy: default
+        Tags:
+          - Key: Name
+            Value: 'elasticsearch-vpc'
+    VPCCidrBlock:
+      Type: 'AWS::EC2::VPCCidrBlock'
+      Properties:
+        AmazonProvidedIpv6CidrBlock: true
+        VpcId: !Ref VPC
+    InternetGateway:
+      Type: 'AWS::EC2::InternetGateway'
+      Properties:
+        Tags:
+          - Key: Name
+            Value: 'es-ig'
+    EgressOnlyInternetGateway:
+      Type: 'AWS::EC2::EgressOnlyInternetGateway'
+      Properties:
+        VpcId: !Ref VPC
+    VPCGatewayAttachment:
+      Type: 'AWS::EC2::VPCGatewayAttachment'
+      Properties:
+        VpcId: !Ref VPC
+        InternetGatewayId: !Ref InternetGateway
+    SubnetAPublic:
+      DependsOn: VPCCidrBlock
+      Type: 'AWS::EC2::Subnet'
+      Properties:
+        AvailabilityZone: !Select [0, !GetAZs '']
+        CidrBlock: !Sub '30.0.0.0/24'
+        Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt 'VPC.Ipv6CidrBlocks'], 4, 64]]
+        MapPublicIpOnLaunch: false
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'es-sub-pub-a'
+          - Key: Reach
+            Value: public
+    SubnetAPrivate:
+      DependsOn: VPCCidrBlock
+      Type: 'AWS::EC2::Subnet'
+      Properties:
+        AvailabilityZone: !Select [0, !GetAZs '']
+        CidrBlock: !Sub '30.0.1.0/24'
+        Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt 'VPC.Ipv6CidrBlocks'], 4, 64]]
+        MapPublicIpOnLaunch: false
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'es-sub-pvt-a'
+          - Key: Reach
+            Value: private
+    SubnetBPublic:
+      DependsOn: VPCCidrBlock
+      Type: 'AWS::EC2::Subnet'
+      Properties:
+        MapPublicIpOnLaunch: false
+        AvailabilityZone: !Select [1, !GetAZs '']
+        CidrBlock: !Sub '30.0.2.0/24'
+        Ipv6CidrBlock: !Select [2, !Cidr [!Select [0, !GetAtt 'VPC.Ipv6CidrBlocks'], 4, 64]]
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'es-sub-pub-b'
+          - Key: Reach
+            Value: public
+    SubnetBPrivate:
+      DependsOn: VPCCidrBlock
+      Type: 'AWS::EC2::Subnet'
+      Properties:
+        MapPublicIpOnLaunch: false
+        AvailabilityZone: !Select [1, !GetAZs '']
+        CidrBlock: !Sub '30.0.3.0/24'
+        Ipv6CidrBlock: !Select [3, !Cidr [!Select [0, !GetAtt 'VPC.Ipv6CidrBlocks'], 4, 64]]
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'es-sub-pvt-b'
+          - Key: Reach
+            Value: private
+    RouteTablePublic:
+      Type: 'AWS::EC2::RouteTable'
+      Properties:
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'rt-pub-a'
+    RouteTablePrivate:
+      Type: 'AWS::EC2::RouteTable'
+      Properties:
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'rt-pvt-a'
+    RouteTableBPublic:
+      Type: 'AWS::EC2::RouteTable'
+      Properties:
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'rt-pub-b'
+    RouteTableBPrivate:
+      Type: 'AWS::EC2::RouteTable'
+      Properties:
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'rt-pvt-b'
+    RouteTableAssociationAPublic:
+      Type: 'AWS::EC2::SubnetRouteTableAssociation'
+      Properties:
+        SubnetId: !Ref SubnetAPublic
+        RouteTableId: !Ref RouteTablePublic
+    RouteTableAssociationAPrivate:
+      Type: 'AWS::EC2::SubnetRouteTableAssociation'
+      Properties:
+        SubnetId: !Ref SubnetAPrivate
+        RouteTableId: !Ref RouteTablePrivate
+    RouteTableAssociationBPublic:
+      Type: 'AWS::EC2::SubnetRouteTableAssociation'
+      Properties:
+        SubnetId: !Ref SubnetBPublic
+        RouteTableId: !Ref RouteTableBPublic
+    RouteTableAssociationBPrivate:
+      Type: 'AWS::EC2::SubnetRouteTableAssociation'
+      Properties:
+        SubnetId: !Ref SubnetBPrivate
+        RouteTableId: !Ref RouteTableBPrivate
+    RouteTablePublicInternetRoute:
+      Type: 'AWS::EC2::Route'
+      DependsOn: VPCGatewayAttachment
+      Properties:
+        RouteTableId: !Ref RouteTablePublic
+        DestinationCidrBlock: '0.0.0.0/0'
+        GatewayId: !Ref InternetGateway
+    RouteTablePublicAInternetRouteIPv6:
+      Type: 'AWS::EC2::Route'
+      DependsOn: VPCGatewayAttachment
+      Properties:
+        RouteTableId: !Ref RouteTablePublic
+        DestinationIpv6CidrBlock: '::/0'
+        GatewayId: !Ref InternetGateway
+    RouteTablePrivateAInternetRouteIPv6:
+      Type: 'AWS::EC2::Route'
+      Properties:
+        RouteTableId: !Ref RouteTablePrivate
+        DestinationIpv6CidrBlock: '::/0'
+        EgressOnlyInternetGatewayId: !Ref EgressOnlyInternetGateway
+    RouteTablePublicBInternetRoute:
+      Type: 'AWS::EC2::Route'
+      DependsOn: VPCGatewayAttachment
+      Properties:
+        RouteTableId: !Ref RouteTableBPublic
+        DestinationCidrBlock: '0.0.0.0/0'
+        GatewayId: !Ref InternetGateway
+    RouteTablePublicBInternetRouteIPv6:
+      Type: 'AWS::EC2::Route'
+      DependsOn: VPCGatewayAttachment
+      Properties:
+        RouteTableId: !Ref RouteTableBPublic
+        DestinationIpv6CidrBlock: '::/0'
+        GatewayId: !Ref InternetGateway
+    RouteTablePrivateBInternetRouteIPv6:
+      Type: 'AWS::EC2::Route'
+      Properties:
+        RouteTableId: !Ref RouteTableBPrivate
+        DestinationIpv6CidrBlock: '::/0'
+        EgressOnlyInternetGatewayId: !Ref EgressOnlyInternetGateway
+    NetworkAclPublic:
+      Type: 'AWS::EC2::NetworkAcl'
+      Properties:
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'es-nacl-pub'
+    NetworkAclPrivate:
+      Type: 'AWS::EC2::NetworkAcl'
+      Properties:
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: 'es-nacl-pvt'
+    SubnetNetworkAclAssociationAPublic:
+      Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+      Properties:
+        SubnetId: !Ref SubnetAPublic
+        NetworkAclId: !Ref NetworkAclPublic
+    SubnetNetworkAclAssociationAPrivate:
+      Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+      Properties:
+        SubnetId: !Ref SubnetAPrivate
+        NetworkAclId: !Ref NetworkAclPrivate
+    SubnetNetworkAclAssociationBPublic:
+      Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+      Properties:
+        SubnetId: !Ref SubnetBPublic
+        NetworkAclId: !Ref NetworkAclPublic
+    SubnetNetworkAclAssociationBPrivate:
+      Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+      Properties:
+        SubnetId: !Ref SubnetBPrivate
+        NetworkAclId: !Ref NetworkAclPrivate
+    NetworkAclEntryInPublicAllowAll:
+      Type: 'AWS::EC2::NetworkAclEntry'
+      Properties:
+        NetworkAclId: !Ref NetworkAclPublic
+        RuleNumber: 99
+        Protocol: -1
+        RuleAction: allow
+        Egress: false
+        CidrBlock: '0.0.0.0/0'
+    NetworkAclEntryInPublicAllowAllIPv6:
+      Type: 'AWS::EC2::NetworkAclEntry'
+      Properties:
+        NetworkAclId: !Ref NetworkAclPublic
+        RuleNumber: 98
+        Protocol: -1
+        RuleAction: allow
+        Egress: false
+        Ipv6CidrBlock: '::/0'
+    NetworkAclEntryOutPublicAllowAll:
+      Type: 'AWS::EC2::NetworkAclEntry'
+      Properties:
+        NetworkAclId: !Ref NetworkAclPublic
+        RuleNumber: 99
+        Protocol: -1
+        RuleAction: allow
+        Egress: true
+        CidrBlock: '0.0.0.0/0'
+    NetworkAclEntryOutPublicAllowAllIPv6:
+      Type: 'AWS::EC2::NetworkAclEntry'
+      Properties:
+        NetworkAclId: !Ref NetworkAclPublic
+        RuleNumber: 98
+        Protocol: -1
+        RuleAction: allow
+        Egress: true
+        Ipv6CidrBlock: '::/0'
+    NetworkAclEntryInPrivateAllowAll:
+      Type: 'AWS::EC2::NetworkAclEntry'
+      Properties:
+        NetworkAclId: !Ref NetworkAclPrivate
+        RuleNumber: 99
+        Protocol: -1
+        RuleAction: allow
+        Egress: false
+        CidrBlock: '0.0.0.0/0'
+    NetworkAclEntryInPrivateAllowAllIPv6:
+      Type: 'AWS::EC2::NetworkAclEntry'
+      Properties:
+        NetworkAclId: !Ref NetworkAclPrivate
+        RuleNumber: 98
+        Protocol: -1
+        RuleAction: allow
+        Egress: false
+        Ipv6CidrBlock: '::/0'
+    NetworkAclEntryOutPrivateAllowAll:
+      Type: 'AWS::EC2::NetworkAclEntry'
+      Properties:
+        NetworkAclId: !Ref NetworkAclPrivate
+        RuleNumber: 99
+        Protocol: -1
+        RuleAction: allow
+        Egress: true
+        CidrBlock: '0.0.0.0/0'
+    NetworkAclEntryOutPrivateAllowAllIPv6:
+      Type: 'AWS::EC2::NetworkAclEntry'
+      Properties:
+        NetworkAclId: !Ref NetworkAclPrivate
+        RuleNumber: 98
+        Protocol: -1
+        RuleAction: allow
+        Egress: true
+        Ipv6CidrBlock: '::/0'
+
+    LogGroup:
+      Type: 'AWS::Logs::LogGroup'
+      Properties:
+        RetentionInDays: 14
+
+    Role:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: 'vpc-flow-logs.amazonaws.com'
+              Action: 'sts:AssumeRole'
+        Policies:
+          - PolicyName: 'flowlogs-policy'
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 'logs:CreateLogGroup'
+                    - 'logs:CreateLogStream'
+                    - 'logs:PutLogEvents'
+                    - 'logs:DescribeLogGroups'
+                    - 'logs:DescribeLogStreams'
+                  Resource: !GetAtt 'LogGroup.Arn'
+
+    FlowLog:
+      Type: 'AWS::EC2::FlowLog'
+      Properties:
+        DeliverLogsPermissionArn: !GetAtt 'Role.Arn'
+        LogGroupName: !Ref LogGroup
+        ResourceId: !Ref VPC
+        ResourceType: VPC
+        Tags:
+          - Key: Name
+            Value: 'es-vpc-flow-log'
+        TrafficType: ALL
+
+    Endpoint:
+      Type: 'AWS::EC2::VPCEndpoint'
+      Properties:
+        PrivateDnsEnabled: true
+        ServiceName: 'com.amazonaws.${self:provider.region}.ec2'
+        SubnetIds:
+          - !Ref SubnetAPrivate
+          - !Ref SubnetBPrivate
+        VpcEndpointType: Interface
+        VpcId: !Ref VPC
+
+    EsSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: SG for elastic search
+        VpcId:
+          Ref: VPC
+        Tags:
+          - Key: Name
+            Value:  'es-domain-sg'
+    EsSecurityGroupHttpIngress:
+      Type: AWS::EC2::SecurityGroupIngress
+      Properties:
+        GroupId:
+          Ref: EsSecurityGroup
+        IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        SourceSecurityGroupId:
+          Ref: EsSecurityGroup
+    EsSecurityGroupHttpsIngress:
+      Type: AWS::EC2::SecurityGroupIngress
+      Properties:
+        GroupId:
+          Ref: EsSecurityGroup
+        IpProtocol: tcp
+        FromPort: '443'
+        ToPort: '443'
+        SourceSecurityGroupId:
+          Ref: EsSecurityGroup
+    EIP:
+      Type: AWS::EC2::EIP
+      Properties:
+        Domain: vpc
+        Tags:
+          - Key: Name
+            Value: es-nat-eip
+    NAT:
+      DependsOn: EIP
+      Type: AWS::EC2::NatGateway
+      Properties:
+        AllocationId:
+          Fn::GetAtt:
+            - EIP
+            - AllocationId
+        SubnetId: !Ref SubnetAPublic
+        Tags:
+          - Key: Name
+            Value: es-nat
+
+    RouteTablePrivateA:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: !Ref RouteTablePrivate
+        DestinationCidrBlock: 0.0.0.0/0
+        NatGatewayId:
+          Ref: NAT
+    RouteTablePrivateB:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: !Ref RouteTableBPrivate
+        DestinationCidrBlock: 0.0.0.0/0
+        NatGatewayId:
+          Ref: NAT
+
+    AuditEs:
+      Type: 'AWS::Elasticsearch::Domain'
+      DependsOn: LogGroup
+      Properties:
+        ElasticsearchVersion: '6.7'
+        DomainName: ${self:provider.environment.AUDIT_TRAIL_ES}
+        ElasticsearchClusterConfig:
+          DedicatedMasterEnabled: false
+          ZoneAwarenessEnabled: false
+          InstanceCount: 1
+          InstanceType: '${file(../env.yml):${opt:stage}.esInstance}'
+        EBSOptions:
+          EBSEnabled: true
+          Iops: 0
+          VolumeSize: 10
+          VolumeType: 'gp2'
+        NodeToNodeEncryptionOptions:
+          Enabled: true
+        EncryptionAtRestOptions:
+          Enabled: true
+          KmsKeyId: !Ref EsKmsKey
+        VPCOptions:
+          SecurityGroupIds:
+            - !Ref EsSecurityGroup
+          SubnetIds:
+            - !Ref SubnetAPublic
+
+
+    ApiGatewayAuthorizer:
+      DependsOn:
+        - ApiGatewayRestApi
+      Type: AWS::ApiGateway::Authorizer
+      Properties:
+        AuthorizerResultTtlInSeconds: 300
+        IdentitySource: method.request.header.Authorization
+        RestApiId:
+          Ref: ApiGatewayRestApi
+        Type: COGNITO_USER_POOLS
+        Name: Authorizer
+        ProviderARNs:
+          - Fn::Join:
+              - ''
+              - - 'arn:aws:cognito-idp:'
+                - ${self:provider.region}
+                - ':'
+                - Ref: AWS::AccountId
+                - ':userpool/'
+                - Fn::ImportValue: ${self:provider.stage}-UserPoolId
+
+plugins:
+  - serverless-webpack
+  - serverless-prune-plugin
+  - serverless-cloudformation-resource-counter
+  - serverless-plugin-lambda-dead-letter
+
+Outputs:
+  DomainArn:
+    Value: !GetAtt AuditEs.DomainArn
+  DomainEndpoint:
+    Value: !GetAtt AuditEs.DomainEndpoint
